@@ -1,0 +1,9 @@
+pdfminer.six
+python-docx
+spacy
+nltk
+pandas
+fastapi
+uvicorn[standard]
+python-multipart
+sentence-transformers
