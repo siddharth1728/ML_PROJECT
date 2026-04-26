@@ -10,6 +10,9 @@ Cleaning Pipeline:
     3. Remove non-printable/control characters
     4. Standardize bullet points
     5. Normalize whitespace
+
+NOTE: Uses pypdf (pure Python) instead of pdfminer.six to avoid
+      DLL/Rust dependency issues on restricted Windows environments.
 """
 
 import re
@@ -18,28 +21,31 @@ import io
 import unicodedata
 from typing import Union, Optional
 
-from pdfminer.high_level import extract_text
-from pdfminer.layout import LAParams
+# pypdf is pure Python — no Rust/DLL, works on restricted machines
+from pypdf import PdfReader
 from docx import Document
 
 
 def extract_text_from_pdf(source: Union[str, bytes, io.BytesIO]) -> str:
-    """Extract raw text from a PDF file using pdfminer.six."""
-    laparams = LAParams(
-        line_margin=0.5, word_margin=0.1, char_margin=2.0,
-        boxes_flow=0.5, detect_vertical=False
-    )
+    """Extract raw text from a PDF file using pypdf."""
     if isinstance(source, str):
         if not os.path.exists(source):
             raise FileNotFoundError(f"PDF file not found: {source}")
-        return extract_text(source, laparams=laparams)
+        reader = PdfReader(source)
     elif isinstance(source, bytes):
-        return extract_text(io.BytesIO(source), laparams=laparams)
+        reader = PdfReader(io.BytesIO(source))
     elif isinstance(source, io.BytesIO):
         source.seek(0)
-        return extract_text(source, laparams=laparams)
+        reader = PdfReader(source)
     else:
         raise ValueError(f"Unsupported source type: {type(source)}")
+
+    text_parts = []
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text_parts.append(page_text)
+    return "\n".join(text_parts)
 
 
 def extract_text_from_docx(source: Union[str, bytes, io.BytesIO]) -> str:

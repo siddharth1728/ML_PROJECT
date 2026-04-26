@@ -1,34 +1,27 @@
 """
-entity_extractor.py - spaCy NER-Based Entity Extraction
+entity_extractor.py - Regex-Based Entity Extraction (No spaCy)
 
-Uses spaCy's Named Entity Recognition (NER) pipeline to extract:
-    - Candidate Name (PERSON entities)
-    - University/Institution Names (ORG entities)
-    - Degree Titles (pattern matching + NER)
-    - Date Ranges (DATE entities + regex)
+Extracts structured data from resume text using pure Python + regex.
+Replaces spaCy NER to avoid DLL/Rust dependency issues on restricted
+Windows environments.
+
+Extracts:
+    - Candidate Name
+    - Organization / Institution Names
+    - Date Ranges
     - Experience entries (Company, Role, Dates, Description)
     - Education entries (Institution, Degree, Dates, GPA)
 """
 
 import re
-import spacy
 from typing import Dict, List, Optional
 
 
-# Load spaCy model globally for efficiency
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    print("WARNING: spaCy model 'en_core_web_sm' not found.")
-    print("Install it with: python -m spacy download en_core_web_sm")
-    nlp = None
-
-
 # ─────────────────────────────────────────────────────────────
-# PATTERNS FOR EXPERIENCE & EDUCATION PARSING
+# COMPILED REGEX PATTERNS
 # ─────────────────────────────────────────────────────────────
 
-# Date range patterns (e.g., "Jan 2020 - Present", "2018-2022", "March 2019 - Dec 2021")
+# Date range: "Jan 2020 - Present", "2018–2022", "March 2019 to Dec 2021"
 DATE_RANGE_PATTERN = re.compile(
     r'(?:(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
     r'Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|'
@@ -42,7 +35,7 @@ DATE_RANGE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# GPA pattern
+# GPA: "GPA: 3.8/4.0", "CGPA 8.5"
 GPA_PATTERN = re.compile(
     r'(?:GPA|CGPA|Grade|Score)\s*:?\s*(\d+\.?\d*)\s*(?:/\s*(\d+\.?\d*))?',
     re.IGNORECASE
@@ -57,7 +50,20 @@ DEGREE_PATTERNS = [
     re.compile(r'(?:Diploma|Certificate|Certification)\s*(?:of|in|\.?\s*)?\s*[A-Z][A-Za-z\s&,]+', re.IGNORECASE),
 ]
 
-# Job title patterns (common role keywords)
+# Email and phone (used to filter out false-positive names)
+EMAIL_PATTERN = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
+PHONE_PATTERN = re.compile(r'[\+\(]?[\d\s\-\(\)]{7,15}')
+
+# Words that disqualify a line from being a person's name
+NAME_BLACKLIST = {
+    'university', 'college', 'institute', 'school', 'academy',
+    'inc', 'corp', 'ltd', 'llc', 'pvt', 'technologies', 'solutions',
+    'resume', 'curriculum', 'vitae', 'profile', 'summary', 'objective',
+    'experience', 'education', 'skills', 'projects', 'certifications',
+    'email', 'phone', 'mobile', 'address', 'linkedin', 'github'
+}
+
+# Keywords that suggest a line is a job title/role
 ROLE_KEYWORDS = [
     'engineer', 'developer', 'architect', 'manager', 'director',
     'analyst', 'scientist', 'designer', 'lead', 'senior', 'junior',
@@ -67,16 +73,26 @@ ROLE_KEYWORDS = [
     'researcher', 'professor', 'instructor', 'teacher', 'trainer'
 ]
 
+# Keywords that suggest a line is an institution name
+INSTITUTION_KEYWORDS = [
+    'university', 'college', 'institute', 'school', 'academy',
+    'polytechnic', 'iit', 'nit', 'iiit', 'bits', 'faculty', 'department'
+]
+
+
+# ─────────────────────────────────────────────────────────────
+# NAME EXTRACTION
+# ─────────────────────────────────────────────────────────────
 
 def extract_name(text: str) -> Optional[str]:
     """
-    Extract candidate name from resume text using spaCy NER.
+    Extract candidate name from the top of the resume.
 
-    Strategy:
-        1. Process the first ~500 chars (name is typically at the top)
-        2. Find PERSON entities
-        3. Return the first PERSON entity with 2-4 words (likely a name)
-        4. Fallback: return the first non-empty line if no NER match
+    Strategy (no NER):
+        1. Only scan the first ~500 characters (name is at the top).
+        2. Skip lines that look like emails, phones, URLs, or section headers.
+        3. Return the first short line (2–4 words) made of capitalized words.
+        4. Fallback: return the very first non-empty line.
 
     Args:
         text: Full resume text.
@@ -84,117 +100,138 @@ def extract_name(text: str) -> Optional[str]:
     Returns:
         Candidate name string or None.
     """
-    if nlp is None:
-        return _fallback_name(text)
-
-    # Only look at the header area (first ~500 chars)
     header = text[:500]
-    doc = nlp(header)
+    lines = [l.strip() for l in header.split('\n') if l.strip()]
 
-    # Find PERSON entities
-    person_entities = [
-        ent.text.strip() for ent in doc.ents
-        if ent.label_ == "PERSON"
-    ]
+    for line in lines:
+        # Skip lines with emails, phones, or URLs
+        if EMAIL_PATTERN.search(line):
+            continue
+        if PHONE_PATTERN.search(line):
+            continue
+        if 'http' in line.lower() or 'www.' in line.lower():
+            continue
+        # Skip lines that are clearly section headers or contact info
+        lower = line.lower()
+        if any(kw in lower for kw in NAME_BLACKLIST):
+            continue
+        # Skip lines with special characters typical of contact lines
+        if any(ch in line for ch in ['@', '|', '/', '\\', '#']):
+            continue
 
-    for name in person_entities:
-        words = name.split()
-        # A real name typically has 2-4 words
+        words = line.split()
+        # A person's name is typically 2–4 words, all starting capitalized
         if 2 <= len(words) <= 4:
-            # Filter out common false positives
-            lower = name.lower()
-            if not any(kw in lower for kw in ['university', 'college', 'inc', 'corp', 'ltd']):
-                return name
-
-    # If NER found PERSON entities but none passed validation, return first
-    if person_entities:
-        return person_entities[0]
-
-    # Fallback: first non-empty line
-    return _fallback_name(text)
-
-
-def _fallback_name(text: str) -> Optional[str]:
-    """Fallback name extraction: return the first non-empty short line."""
-    for line in text.split('\n'):
-        line = line.strip()
-        if line and len(line.split()) <= 4 and len(line) < 50:
-            # Check it's not an email or phone
-            if '@' not in line and not re.search(r'\d{3}', line):
+            if all(w[0].isupper() for w in words if w.isalpha()):
                 return line
+
+    # Fallback: first non-empty line that isn't too long
+    for line in lines:
+        if line and len(line.split()) <= 4 and len(line) < 50:
+            if '@' not in line and not PHONE_PATTERN.search(line):
+                return line
+
     return None
 
 
+# ─────────────────────────────────────────────────────────────
+# ORGANIZATION EXTRACTION
+# ─────────────────────────────────────────────────────────────
+
 def extract_organizations(text: str) -> List[str]:
     """
-    Extract organization names from text using spaCy NER.
+    Extract organization names from text using heuristics.
+
+    Looks for lines/phrases containing known org keywords
+    (Inc, Corp, Ltd, Technologies, University, etc.)
 
     Args:
-        text: Resume text to analyze.
+        text: Resume text.
 
     Returns:
-        List of unique organization names (companies, universities).
+        List of unique organization name strings.
     """
-    if nlp is None:
-        return []
+    ORG_SUFFIXES = re.compile(
+        r'\b(?:Inc\.?|Corp\.?|Ltd\.?|LLC|LLP|Pvt\.?|Technologies|Solutions|'
+        r'Systems|Services|Group|Consulting|Labs|University|College|Institute|'
+        r'School|Academy|Foundation|Agency|Studio|Works|Partners|Ventures)\b',
+        re.IGNORECASE
+    )
 
-    doc = nlp(text)
     orgs = []
     seen = set()
 
-    for ent in doc.ents:
-        if ent.label_ == "ORG":
-            org_name = ent.text.strip()
-            org_lower = org_name.lower()
-            # Filter out very short or very long org names
-            if 2 <= len(org_name) <= 60 and org_lower not in seen:
-                seen.add(org_lower)
-                orgs.append(org_name)
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line or len(line) > 80:
+            continue
+        if ORG_SUFFIXES.search(line):
+            key = line.lower()
+            if key not in seen:
+                seen.add(key)
+                orgs.append(line)
 
     return orgs
 
+
+# ─────────────────────────────────────────────────────────────
+# DATE EXTRACTION
+# ─────────────────────────────────────────────────────────────
 
 def extract_dates(text: str) -> List[str]:
     """
     Extract date ranges from text.
 
     Args:
-        text: Text to search for date ranges.
+        text: Text to search.
 
     Returns:
-        List of date range strings found.
+        List of date range strings.
     """
     return DATE_RANGE_PATTERN.findall(text)
 
 
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+
 def _detect_role(line: str) -> bool:
-    """Check if a line likely contains a job title."""
+    """Return True if the line likely contains a job title."""
     lower = line.lower()
     return any(kw in lower for kw in ROLE_KEYWORDS)
 
+
+def _detect_institution(line: str) -> bool:
+    """Return True if the line likely contains an institution name."""
+    lower = line.lower()
+    return any(kw in lower for kw in INSTITUTION_KEYWORDS)
+
+
+# ─────────────────────────────────────────────────────────────
+# EXPERIENCE PARSING
+# ─────────────────────────────────────────────────────────────
 
 def parse_experience(experience_text: str) -> List[Dict[str, str]]:
     """
     Parse the experience section into structured entries.
 
     Each entry contains:
-        - company: Organization name
-        - title: Job title/role
-        - dates: Employment date range
-        - description: Bullet points / description text
+        - company:     Organization name
+        - title:       Job title / role
+        - dates:       Employment date range
+        - description: Bullet points / responsibilities
 
     Strategy:
-        1. Split text into blocks separated by blank lines or date-containing lines
-        2. Use NER to identify company names (ORG entities)
-        3. Use keyword matching to identify job titles
-        4. Use regex to extract date ranges
-        5. Remaining text becomes the description
+        1. Walk through lines; detect date-range lines as entry boundaries.
+        2. Use role-keyword matching to identify job titles.
+        3. Use separator patterns (" | ", " — ") to split company/title.
+        4. Remaining lines become the description.
 
     Args:
-        experience_text: Text from the Experience section.
+        experience_text: Text of the Experience section.
 
     Returns:
-        List of experience entry dictionaries.
+        List of experience entry dicts.
     """
     if not experience_text:
         return []
@@ -210,13 +247,10 @@ def parse_experience(experience_text: str) -> List[Dict[str, str]]:
         if not line:
             continue
 
-        # Check for date range
         date_match = DATE_RANGE_PATTERN.search(line)
 
-        # Check if this line starts a new entry
-        # (has a date range or looks like a company/title header)
         if date_match:
-            # If we already have accumulated data, save the previous entry
+            # Save previous entry if it has data
             if current_entry["company"] or current_entry["title"]:
                 current_entry["description"] = '\n'.join(description_lines).strip()
                 entries.append(current_entry)
@@ -225,7 +259,7 @@ def parse_experience(experience_text: str) -> List[Dict[str, str]]:
 
             current_entry["dates"] = date_match.group(0).strip()
 
-            # The rest of the line might contain company/title info
+            # Anything left on the same line after stripping the date
             remaining = DATE_RANGE_PATTERN.sub('', line).strip()
             remaining = re.sub(r'^[\s|,\-\u2013\u2014]+|[\s|,\-\u2013\u2014]+$', '', remaining)
 
@@ -236,12 +270,10 @@ def parse_experience(experience_text: str) -> List[Dict[str, str]]:
                     current_entry["company"] = remaining
 
         elif not current_entry["company"] and not current_entry["title"]:
-            # First lines after a new entry starts — look for company/title
-            # Lines with separators like " — " or " | " or " - " often split company/title
+            # Try to split on common separators: " — ", " | ", " - "
             parts = re.split(r'\s*[\u2013\u2014|]\s*|\s+-\s+', line)
 
             if len(parts) >= 2:
-                # e.g., "Google — Software Engineer" or "Software Engineer | Google"
                 if _detect_role(parts[0]):
                     current_entry["title"] = parts[0].strip()
                     current_entry["company"] = parts[1].strip()
@@ -259,9 +291,9 @@ def parse_experience(experience_text: str) -> List[Dict[str, str]]:
 
         elif not current_entry["title"] and _detect_role(line):
             current_entry["title"] = line
+
         elif not current_entry["company"] and not _detect_role(line):
-            # If we don't have a company yet, and this isn't a role line
-            if not date_match and len(line.split()) <= 6:
+            if len(line.split()) <= 6:
                 current_entry["company"] = line
             else:
                 description_lines.append(line)
@@ -273,34 +305,41 @@ def parse_experience(experience_text: str) -> List[Dict[str, str]]:
         current_entry["description"] = '\n'.join(description_lines).strip()
         entries.append(current_entry)
 
-    # Use NER to fill in missing company names
-    if nlp is not None:
-        for entry in entries:
-            if not entry["company"] and entry["description"]:
-                doc = nlp(entry["description"][:200])
-                for ent in doc.ents:
-                    if ent.label_ == "ORG":
-                        entry["company"] = ent.text
-                        break
+    # Fill in missing company names using org heuristics from description
+    for entry in entries:
+        if not entry["company"] and entry["description"]:
+            orgs = extract_organizations(entry["description"][:300])
+            if orgs:
+                entry["company"] = orgs[0]
 
     return entries
 
+
+# ─────────────────────────────────────────────────────────────
+# EDUCATION PARSING
+# ─────────────────────────────────────────────────────────────
 
 def parse_education(education_text: str) -> List[Dict[str, str]]:
     """
     Parse the education section into structured entries.
 
     Each entry contains:
-        - institution: University/college name
-        - degree: Degree title
-        - dates: Attendance date range
-        - gpa: GPA score (if found)
+        - institution: University / college name
+        - degree:      Degree title
+        - dates:       Attendance date range
+        - gpa:         GPA score (if found)
+
+    Strategy:
+        1. Scan each line for degree patterns → marks start of an entry.
+        2. Detect date ranges and GPA via regex.
+        3. Detect institution names by keyword (university, college, etc.)
+           or by capitalized short lines near degree lines.
 
     Args:
-        education_text: Text from the Education section.
+        education_text: Text of the Education section.
 
     Returns:
-        List of education entry dictionaries.
+        List of education entry dicts.
     """
     if not education_text:
         return []
@@ -310,75 +349,52 @@ def parse_education(education_text: str) -> List[Dict[str, str]]:
     current_entry = {"institution": "", "degree": "", "dates": "", "gpa": ""}
     used_lines = set()
 
-    # First pass: extract dates and GPA
+    # First pass: degrees, dates, GPA
     for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
+        line_s = line.strip()
+        if not line_s:
             continue
 
-        # Check for degree patterns
         for pattern in DEGREE_PATTERNS:
-            degree_match = pattern.search(line)
+            degree_match = pattern.search(line_s)
             if degree_match:
-                # If we already have a degree, this might be a new entry
                 if current_entry["degree"] and current_entry["institution"]:
                     entries.append(current_entry)
                     current_entry = {"institution": "", "degree": "", "dates": "", "gpa": ""}
-
-                current_entry["degree"] = degree_match.group(0).strip()
-                # Clean trailing punctuation
-                current_entry["degree"] = re.sub(r'[\s,]+$', '', current_entry["degree"])
+                current_entry["degree"] = re.sub(
+                    r'[\s,]+$', '', degree_match.group(0).strip()
+                )
                 used_lines.add(i)
                 break
 
-        # Check for dates
-        date_match = DATE_RANGE_PATTERN.search(line)
+        date_match = DATE_RANGE_PATTERN.search(line_s)
         if date_match:
             current_entry["dates"] = date_match.group(0).strip()
             used_lines.add(i)
 
-        # Check for GPA
-        gpa_match = GPA_PATTERN.search(line)
+        gpa_match = GPA_PATTERN.search(line_s)
         if gpa_match:
             gpa_val = gpa_match.group(1)
-            scale = gpa_match.group(2) if gpa_match.group(2) else ""
+            scale = gpa_match.group(2) or ""
             current_entry["gpa"] = f"{gpa_val}/{scale}" if scale else gpa_val
             used_lines.add(i)
 
-    # Second pass: find institution names using NER and remaining lines
+    # Second pass: institution names
     for i, line in enumerate(lines):
-        line = line.strip()
-        if not line or i in used_lines:
+        line_s = line.strip()
+        if not line_s or i in used_lines:
             continue
 
-        # If this looks like an institution name (use NER or heuristics)
-        institution_keywords = [
-            'university', 'college', 'institute', 'school',
-            'academy', 'polytechnic', 'iit', 'nit', 'iiit', 'bits'
-        ]
-        lower = line.lower()
-
-        if any(kw in lower for kw in institution_keywords):
+        if _detect_institution(line_s):
             if current_entry["institution"] and (current_entry["degree"] or current_entry["dates"]):
                 entries.append(current_entry)
                 current_entry = {"institution": "", "degree": "", "dates": "", "gpa": ""}
-            current_entry["institution"] = line
+            current_entry["institution"] = line_s
             used_lines.add(i)
-        elif not current_entry["institution"] and len(line.split()) <= 8:
-            # Short line without a degree/date — might be institution name
-            current_entry["institution"] = line
+        elif not current_entry["institution"] and len(line_s.split()) <= 8:
+            # Short, unused line near degree — likely institution name
+            current_entry["institution"] = line_s
             used_lines.add(i)
-
-    # Try NER for institution names if still missing
-    if nlp is not None and not current_entry["institution"]:
-        doc = nlp(education_text[:500])
-        for ent in doc.ents:
-            if ent.label_ == "ORG":
-                org = ent.text.strip()
-                lower_org = org.lower()
-                if any(kw in lower_org for kw in ['university', 'college', 'institute', 'school']):
-                    current_entry["institution"] = org
-                    break
 
     # Save last entry
     if current_entry["institution"] or current_entry["degree"]:
@@ -387,6 +403,9 @@ def parse_education(education_text: str) -> List[Dict[str, str]]:
     return entries
 
 
+# ─────────────────────────────────────────────────────────────
+# QUICK TEST
+# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import json
 
@@ -402,8 +421,7 @@ Built front-end components using React and TypeScript.
 Developed RESTful APIs serving 500K+ daily requests.
 """
     print("=== EXPERIENCE ===")
-    exp_result = parse_experience(sample_exp)
-    print(json.dumps(exp_result, indent=2))
+    print(json.dumps(parse_experience(sample_exp), indent=2))
 
     sample_edu = """
 Massachusetts Institute of Technology
@@ -416,8 +434,7 @@ Master of Science in Artificial Intelligence
 2019 - 2021
 """
     print("\n=== EDUCATION ===")
-    edu_result = parse_education(sample_edu)
-    print(json.dumps(edu_result, indent=2))
+    print(json.dumps(parse_education(sample_edu), indent=2))
 
     print("\n=== NAME ===")
     sample_name = "John Alexander Smith\njohn@email.com\nSan Francisco, CA"
